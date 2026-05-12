@@ -17,8 +17,7 @@ _STOPWORDS = {
     "a", "an", "all", "any", "containing", "contains", "contents", "directory",
     "file", "files", "find", "folder", "folders", "for", "from", "get", "give",
     "in", "inside", "list", "locate", "me", "my", "named", "of", "only", "open",
-    "please", "related", "search", "show", "that", "the", "with", "within",
-    "document", "documents", "image", "images", "called",
+    "please", "related", "search", "show", "that", "the", "with", "within", "called",
 }
 
 MIME_INTENTS = {
