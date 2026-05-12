@@ -259,11 +259,18 @@ def _extension_clause(extensions: list[str]) -> str | None:
 def _term_clause(terms: list[str], field_name: str = "name", mode: str = "and") -> str | None:
     if not terms:
         return None
+
     parts = []
     for term in terms:
-        variants = _term_variants(term)
-        variant_parts = [f"{field_name} contains '{drive_quote(variant)}'" for variant in variants]
-        parts.append(f"({' or '.join(variant_parts)})" if len(variant_parts) > 1 else variant_parts[0])
+        variant_parts = [
+            f"{field_name} contains '{drive_quote(variant)}'"
+            for variant in _term_variants(term)
+        ]
+        if len(variant_parts) > 1:
+            parts.append(f"({' or '.join(variant_parts)})")
+        else:
+            parts.append(variant_parts[0])
+
     joiner = " and " if mode == "and" else " or "
     return f"({joiner.join(parts)})" if len(parts) > 1 else parts[0]
 
@@ -306,7 +313,13 @@ def _search_many_folders(
         files: list[dict[str, Any]] = []
         for folder_id in folder_ids[:MAX_SEARCH_FOLDERS]:
             remaining = max(MAX_RESULT_FILES - len(files), 1)
-            files.extend(search_drive(query=query, folder_id=folder_id, page_size=min(per_folder_limit, remaining)))
+            files.extend(
+                search_drive(
+                    query=query,
+                    folder_id=folder_id,
+                    page_size=min(per_folder_limit, remaining),
+                )
+            )
             if len(files) >= MAX_RESULT_FILES:
                 break
         return dedupe_files(files)[:MAX_RESULT_FILES]
@@ -391,9 +404,14 @@ def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str
         folders = find_matching_folders(parsed, root)
         scope_folder_ids = []
         for folder in folders[:5]:
-            folder_id = folder.get("id")
-            if folder_id:
-                scope_folder_ids.extend(collect_descendant_folder_ids(folder_id, max_folders=MAX_SEARCH_FOLDERS))
+            current_folder_id = folder.get("id")
+            if current_folder_id:
+                scope_folder_ids.extend(
+                    collect_descendant_folder_ids(
+                        current_folder_id,
+                        max_folders=MAX_SEARCH_FOLDERS,
+                    )
+                )
         scope_folder_ids = list(dict.fromkeys(scope_folder_ids))
         if not scope_folder_ids:
             logger.debug("No matching folders found for scoped query=%r", raw_query)
@@ -461,15 +479,22 @@ class SearchFolderContentsTool(BaseTool):
 
     def _run(self, folder_name: str) -> str:
         try:
-            parsed = parse_query(folder_name if "folder" in folder_name.lower() else f"{folder_name} folder")
+            query = folder_name if "folder" in folder_name.lower() else f"{folder_name} folder"
+            parsed = parse_query(query)
             folders = find_matching_folders(parsed, os.getenv("TARGET_FOLDER_ID"))
             files: list[dict[str, Any]] = []
+
             for folder in folders[:5]:
                 folder_id = folder.get("id")
                 if not folder_id:
                     continue
-                for descendant_id in collect_descendant_folder_ids(folder_id, max_folders=MAX_SEARCH_FOLDERS):
+                folder_ids = collect_descendant_folder_ids(
+                    folder_id,
+                    max_folders=MAX_SEARCH_FOLDERS,
+                )
+                for descendant_id in folder_ids:
                     files.extend(search_drive(folder_id=descendant_id, page_size=MAX_RESULT_FILES))
+
             files = dedupe_files(files)[:MAX_RESULT_FILES]
             return json.dumps({"files": _compact_tool_files(files), "count": len(files)})
         except Exception as exc:

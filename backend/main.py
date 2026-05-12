@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 from typing import Any
 
 import requests as http
@@ -93,7 +93,7 @@ async def thumbnail(file_id: str):
     except DriveConfigurationError:
         logger.exception("Thumbnail requested before Drive was configured")
         raise HTTPException(status_code=503, detail="Google Drive is not configured")
-    except Exception as e:
+    except Exception:
         logger.exception("Thumbnail service error file_id=%s", file_id)
         raise HTTPException(status_code=500, detail="Thumbnail service error")
 

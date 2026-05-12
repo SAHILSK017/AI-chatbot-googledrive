@@ -29,6 +29,16 @@ SEARCH_TERMS = {
     "photo", "photos", "pic", "pics", "png", "recent", "resume", "sheet",
     "sheets", "show", "spreadsheet", "spreadsheets",
 }
+SEARCH_STARTERS = {"find", "show", "open", "list", "get", "search"}
+GROQ_LIMIT_MARKERS = (
+    "413",
+    "request too large",
+    "rate_limit_exceeded",
+    "tokens per minute",
+    "token limit",
+    "rate limit",
+    "429",
+)
 
 
 def _build_system_prompt() -> str:
@@ -78,24 +88,14 @@ def _is_simple_search(message: str) -> bool:
         return False
     if len(words) == 1:
         return True
-    starters = {"find", "show", "open", "list", "get", "search"}
-    return len(words) <= 4 and (words[0] in starters or bool(set(words) & SEARCH_TERMS))
+    return len(words) <= 4 and (
+        words[0] in SEARCH_STARTERS or bool(set(words) & SEARCH_TERMS)
+    )
 
 
 def _is_groq_limit_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    return any(
-        marker in text
-        for marker in [
-            "413",
-            "request too large",
-            "rate_limit_exceeded",
-            "tokens per minute",
-            "token limit",
-            "rate limit",
-            "429",
-        ]
-    )
+    return any(marker in text for marker in GROQ_LIMIT_MARKERS)
 
 
 def _files_from_observation(observation: Any) -> list[dict[str, Any]]:
@@ -118,25 +118,6 @@ def _files_from_observation(observation: Any) -> list[dict[str, Any]]:
 
     logger.warning("Unexpected tool observation type=%s", type(payload).__name__)
     return []
-
-
-def _extract_files_from_intermediate_steps(steps: Any) -> list[dict[str, Any]]:
-    if not isinstance(steps, list):
-        logger.warning("intermediate_steps was %s, expected list", type(steps).__name__)
-        return []
-
-    files: list[dict[str, Any]] = []
-    for step in steps:
-        observation = None
-        if isinstance(step, tuple) and len(step) >= 2:
-            observation = step[1]
-        elif isinstance(step, dict):
-            observation = step.get("observation") or step.get("tool_output")
-        else:
-            observation = getattr(step, "observation", None)
-        files.extend(_files_from_observation(observation))
-
-    return dedupe_files(files)
 
 
 def _format_response(message: str, files: list[dict[str, Any]]) -> str:
@@ -163,9 +144,7 @@ def _agent_invoke(message: str) -> tuple[str, list[dict[str, Any]], bool]:
     agent = _get_agent()
     result = agent.invoke({"input": message})
     text = result.get("output", "") if isinstance(result, dict) else str(result)
-    steps = result.get("intermediate_steps", []) if isinstance(result, dict) else []
-    files = _extract_files_from_intermediate_steps(steps)
-    return text, files, bool(steps)
+    return text, [], False
 
 
 def _enhance_with_agent(message: str, files: list[dict[str, Any]]) -> str | None:

@@ -218,10 +218,6 @@ def search_drive(
     return deduped
 
 
-def list_folder_children(folder_id: str, page_size: int = 100) -> list[dict[str, Any]]:
-    return search_drive(query=None, folder_id=folder_id, page_size=page_size)
-
-
 @lru_cache(maxsize=128)
 def collect_descendant_folder_ids(
     root_folder_id: str,
