@@ -14,6 +14,15 @@ _CACHE_TTL = 300  # seconds
 
 @functools.lru_cache(maxsize=1)
 def get_drive_service():
+    """Load credentials from env var (production) or file (local dev)."""
+    import json
+    json_creds = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if json_creds:
+        info = json.loads(json_creds)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        print(f"[drive] Authenticated as: {info.get('client_email', 'unknown')}", flush=True)
+        return build("drive", "v3", credentials=creds)
+
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
         raise FileNotFoundError(f"Credentials not found: {SERVICE_ACCOUNT_FILE}")
     creds = service_account.Credentials.from_service_account_file(
@@ -36,25 +45,25 @@ def search_drive(query: str, folder_id: str = None, page_size: int = 20) -> list
     print(f"[drive] {final_query}", flush=True)
 
     try:
-        data = (
-            service.files()
-            .list(
-                q=final_query,
-                pageSize=page_size,
-                orderBy="modifiedTime desc",
-                fields=(
-                    "nextPageToken, files("
-                    "id, name, mimeType, modifiedTime, createdTime, "
-                    "webViewLink, webContentLink, iconLink, parents, "
-                    "size, owners, thumbnailLink, hasThumbnail"
-                    ")"
-                ),
-                spaces="drive",
-                includeItemsFromAllDrives=True,
-                supportsAllDrives=True,
-            )
-            .execute()
-        )
+        kwargs = {
+            "q": final_query,
+            "pageSize": page_size,
+            "fields": (
+                "nextPageToken, files("
+                "id, name, mimeType, modifiedTime, createdTime, "
+                "webViewLink, webContentLink, iconLink, parents, "
+                "size, owners, thumbnailLink, hasThumbnail"
+                ")"
+            ),
+            "spaces": "drive",
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+        }
+        # Google Drive API forbids orderBy when fullText is used
+        if "fulltext contains" not in final_query.lower():
+            kwargs["orderBy"] = "modifiedTime desc"
+
+        data = service.files().list(**kwargs).execute()
         items = data.get("files", [])
         _query_cache[cache_key] = (items, time.time())
         return items
