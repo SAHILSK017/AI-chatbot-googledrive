@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from langchain.agents import AgentType, initialize_agent
-from langchain.memory import ConversationBufferMemory
+from langchain.memory import ConversationBufferWindowMemory
 from langchain_groq import ChatGroq
 
 from backend.google_drive import DriveConfigurationError, DriveRateLimitError, dedupe_files
@@ -15,7 +15,8 @@ from backend.tools import DriveSearchTool, SearchFolderContentsTool, parse_query
 logger = logging.getLogger(__name__)
 
 _agent = None
-_memory = ConversationBufferMemory(
+_memory = ConversationBufferWindowMemory(
+    k=int(os.getenv("MEMORY_WINDOW", "3")),
     memory_key="chat_history",
     return_messages=True,
     output_key="output",
@@ -32,12 +33,10 @@ SEARCH_TERMS = {
 
 def _build_system_prompt() -> str:
     today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-    return f"""Drive Assistant (Today: {today}).
-You are a concise Google Drive assistant.
-For any request about finding, showing, opening, listing, or filtering Drive files, use google_drive_search.
-Use search_folder_contents only when the user asks for contents inside a named folder.
-Never invent file names. If tools return no files, say no matching files were found.
-Keep responses to one or two short sentences."""
+    return (
+        f"Drive Assistant. Today: {today}. "
+        "Use tools for Drive search. Be concise. Never invent files."
+    )
 
 
 def _get_agent():
@@ -60,8 +59,9 @@ def _get_agent():
         agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
         memory=_memory,
         verbose=os.getenv("LANGCHAIN_VERBOSE", "false").lower() == "true",
-        return_intermediate_steps=True,
+        return_intermediate_steps=False,
         handle_parsing_errors=True,
+        max_iterations=2,
         agent_kwargs={"system_message": _build_system_prompt()},
     )
     return _agent
@@ -70,6 +70,32 @@ def _get_agent():
 def _looks_like_search_query(message: str) -> bool:
     words = set(re.findall(r"[a-zA-Z0-9_+#.-]+", message.lower()))
     return len(words) == 1 or bool(words & SEARCH_TERMS)
+
+
+def _is_simple_search(message: str) -> bool:
+    words = re.findall(r"[a-zA-Z0-9_+#.-]+", message.lower())
+    if not words:
+        return False
+    if len(words) == 1:
+        return True
+    starters = {"find", "show", "open", "list", "get", "search"}
+    return len(words) <= 4 and (words[0] in starters or bool(set(words) & SEARCH_TERMS))
+
+
+def _is_groq_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in [
+            "413",
+            "request too large",
+            "rate_limit_exceeded",
+            "tokens per minute",
+            "token limit",
+            "rate limit",
+            "429",
+        ]
+    )
 
 
 def _files_from_observation(observation: Any) -> list[dict[str, Any]]:
@@ -143,25 +169,25 @@ def _agent_invoke(message: str) -> tuple[str, list[dict[str, Any]], bool]:
 
 
 def _enhance_with_agent(message: str, files: list[dict[str, Any]]) -> str | None:
-    if not files or os.getenv("AI_ENHANCE_RESULTS", "true").lower() == "false":
+    if not files or os.getenv("AI_ENHANCE_RESULTS", "false").lower() != "true":
         return None
     if not os.getenv("GROQ_API_KEY"):
         return None
+    if _is_simple_search(message) or len(files) > int(os.getenv("AI_ENHANCE_MAX_FILES", "5")):
+        return None
 
-    preview = [
-        {"name": file.get("name"), "mimeType": file.get("mimeType")}
-        for file in files[:8]
-    ]
+    names = [file.get("name", "file") for file in files[:3]]
     prompt = (
-        f"User asked: {message}\n"
-        f"Deterministic Drive search found {len(files)} files: {json.dumps(preview)}\n"
-        "Respond with one concise sentence summarizing the result. "
-        "Do not claim there are no files."
+        f"Summarize Drive search result in one short sentence. "
+        f"Query: {message}. Count: {len(files)}. Examples: {', '.join(names)}."
     )
     try:
         text, _, _ = _agent_invoke(prompt)
-    except Exception:
-        logger.exception("Agent enhancement failed; using deterministic response")
+    except Exception as exc:
+        if _is_groq_limit_error(exc):
+            logger.warning("Skipping enhancement due to Groq token/rate limit: %s", exc)
+        else:
+            logger.exception("Agent enhancement failed; using deterministic response")
         return None
 
     lowered = text.lower()
@@ -184,6 +210,8 @@ def chat_with_agent(message: str):
             direct_files = dedupe_files(staged_search(clean))
             logger.debug("Direct search count=%s message=%r", len(direct_files), clean)
             if direct_files:
+                if _is_simple_search(clean):
+                    return _format_response(clean, direct_files), direct_files, True
                 enhanced = _enhance_with_agent(clean, direct_files)
                 return enhanced or _format_response(clean, direct_files), direct_files, True
         except DriveConfigurationError as exc:
@@ -220,11 +248,16 @@ def chat_with_agent(message: str):
         return text or "I can help search your Google Drive.", [], tool_used
 
     except Exception as exc:
-        err = str(exc).lower()
-        if "429" in err or "rate limit" in err:
+        if _is_groq_limit_error(exc):
             logger.exception("LLM rate limit; returning deterministic fallback")
             if direct_files:
                 return _format_response(clean, direct_files), direct_files, True
+            if is_search_query:
+                try:
+                    fallback_files = dedupe_files(staged_search(clean))
+                    return _format_response(clean, fallback_files), fallback_files, True
+                except Exception:
+                    logger.exception("Deterministic fallback after Groq limit failed")
             return "The AI service is busy right now. Please try again shortly.", [], False
 
         logger.exception("LangChain agent failed message=%r", clean)

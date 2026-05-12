@@ -43,8 +43,16 @@ class ChatResponse(BaseModel):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    text, files, tool_used = chat_with_agent(req.message)
-    return ChatResponse(response=text, files=files, tool_used=tool_used)
+    try:
+        text, files, tool_used = chat_with_agent(req.message)
+        return ChatResponse(response=text, files=files, tool_used=tool_used)
+    except Exception:
+        logger.exception("Unhandled /chat failure")
+        return ChatResponse(
+            response="I couldn't complete that request. Please try again.",
+            files=[],
+            tool_used=False,
+        )
 
 
 @app.get("/thumbnail/{file_id}")

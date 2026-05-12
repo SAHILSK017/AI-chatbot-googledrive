@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 MAX_RESULT_FILES = int(os.getenv("MAX_RESULT_FILES", "30"))
 MAX_SEARCH_FOLDERS = int(os.getenv("MAX_SEARCH_FOLDERS", "60"))
+MAX_TOOL_FILES = int(os.getenv("MAX_TOOL_FILES", "8"))
 
 STOPWORDS = {
     "a", "an", "all", "any", "can", "could", "drive", "file", "files",
@@ -159,6 +160,22 @@ def _add_unique(values: list[str], additions: list[str]) -> None:
     for value in additions:
         if value not in values:
             values.append(value)
+
+
+def _compact_tool_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact = []
+    for file in files[:MAX_TOOL_FILES]:
+        compact.append(
+            {
+                "id": file.get("id"),
+                "name": file.get("name"),
+                "mimeType": file.get("mimeType"),
+                "webViewLink": file.get("webViewLink") or file.get("link"),
+                "modifiedTime": file.get("modifiedTime") or file.get("modified"),
+                "size": file.get("size"),
+            }
+        )
+    return compact
 
 
 def _extract_folder_terms(text: str) -> tuple[list[str], bool]:
@@ -413,21 +430,18 @@ def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str
 
 
 class DriveSearchInput(BaseModel):
-    query: str = Field(description="Natural language Google Drive search query.")
+    query: str = Field(description="Drive search query.")
 
 
 class DriveSearchTool(BaseTool):
     name: str = "google_drive_search"
-    description: str = (
-        "Search Google Drive deterministically. Use this for every request to find, "
-        "show, open, list, filter, or search files/folders."
-    )
+    description: str = "Search Google Drive files/folders."
     args_schema: Type[BaseModel] = DriveSearchInput
 
     def _run(self, query: str) -> str:
         try:
             files = staged_search(query)
-            return json.dumps({"files": files, "count": len(files)})
+            return json.dumps({"files": _compact_tool_files(files), "count": len(files)})
         except Exception as exc:
             logger.exception("google_drive_search failed query=%r", query)
             return json.dumps({"files": [], "error": str(exc)})
@@ -437,12 +451,12 @@ class DriveSearchTool(BaseTool):
 
 
 class FolderContentsInput(BaseModel):
-    folder_name: str = Field(description="Folder name to find and list recursively.")
+    folder_name: str = Field(description="Folder name.")
 
 
 class SearchFolderContentsTool(BaseTool):
     name: str = "search_folder_contents"
-    description: str = "Find a folder by name and list its recursive contents."
+    description: str = "List files in a Drive folder."
     args_schema: Type[BaseModel] = FolderContentsInput
 
     def _run(self, folder_name: str) -> str:
@@ -457,7 +471,7 @@ class SearchFolderContentsTool(BaseTool):
                 for descendant_id in collect_descendant_folder_ids(folder_id, max_folders=MAX_SEARCH_FOLDERS):
                     files.extend(search_drive(folder_id=descendant_id, page_size=MAX_RESULT_FILES))
             files = dedupe_files(files)[:MAX_RESULT_FILES]
-            return json.dumps({"files": files, "count": len(files)})
+            return json.dumps({"files": _compact_tool_files(files), "count": len(files)})
         except Exception as exc:
             logger.exception("search_folder_contents failed folder=%r", folder_name)
             return json.dumps({"files": [], "error": str(exc)})
