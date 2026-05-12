@@ -14,11 +14,11 @@ from backend.google_drive import search_drive
 # ---------------------------------------------------------------------------
 
 _STOPWORDS = {
-    "a", "an", "all", "any", "containing", "contains", "contents", "directory",
-    "file", "files", "find", "folder", "folders", "for", "from", "get", "give",
+    "a", "an", "all", "any", "containing", "contains", "contents",
+    "file", "files", "find", "for", "from", "get", "give",
     "in", "inside", "list", "locate", "me", "my", "named", "of", "only", "open",
     "please", "related", "search", "show", "that", "the", "with", "within",
-    "called", "just", "only", "all"
+    "called", "just"
 }
 
 MIME_INTENTS = {
@@ -70,14 +70,13 @@ def _detect_intent(keywords: list) -> dict:
 
         found_mime = False
         for k, v in MIME_INTENTS.items():
-            if k in word:
+            # Exact match allowing for plurals
+            if word == k or word == k + "s":
                 intent["mimeType"] = v
                 found_mime = True
                 break
         
-        # Keep word if it wasn't consumed by intent mapping,
-        # OR if it's explicitly part of a mime intent but might also be part of a file name.
-        # But to be safe and fix the empty keyword issue, if it's just a mime word, we drop it from keywords.
+        # Keep word if it wasn't consumed by intent mapping
         if not found_mime:
             temp_keywords.append(word)
 
@@ -243,7 +242,9 @@ class SearchFolderContentsTool(BaseTool):
     def _run(self, folder_name: str) -> str:
         try:
             root = os.getenv("TARGET_FOLDER_ID")
-            folders = staged_search(f"{folder_name} folder", folder_id=root)
+            # Directly query for the folder by name and mimeType to avoid intent stripping
+            q = f"name contains '{folder_name}' and mimeType = 'application/vnd.google-apps.folder'"
+            folders = search_drive(q, folder_id=root)
             
             if not folders:
                 return json.dumps({"error": f"Folder '{folder_name}' not found.", "files": []})
