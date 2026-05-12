@@ -237,3 +237,25 @@ class SearchFolderContentsTool(BaseTool):
             return json.dumps({"files": files})
         except Exception as e:
             return json.dumps({"error": str(e), "files": []})
+
+
+class DiagnosticInput(BaseModel):
+    pass
+
+class DiagnosticTool(BaseTool):
+    name = "drive_diagnostics"
+    description = "Check which files the bot can see. Use this when searches return 0 results."
+    args_schema: Type[BaseModel] = DiagnosticInput
+
+    def _run(self, *args, **kwargs) -> str:
+        try:
+            from backend.google_drive import search_drive
+            files = search_drive("trashed = false", page_size=10)
+            names = [f["name"] for f in files]
+            return json.dumps({
+                "bot_can_see_count": len(files),
+                "sample_files": names,
+                "message": "If count is 0, the service account has NO permissions. Please share your Drive folder with the client_email."
+            })
+        except Exception as e:
+            return json.dumps({"error": str(e)})
