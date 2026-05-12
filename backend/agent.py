@@ -6,7 +6,7 @@ from langchain.agents import AgentType, initialize_agent
 from langchain.memory import ConversationBufferMemory
 from langchain_groq import ChatGroq
 
-from backend.tools import DriveSearchTool, SearchFolderContentsTool, staged_search
+from backend.tools import DriveSearchTool, SearchFolderContentsTool, DiagnosticTool, staged_search
 
 _agent = None
 _memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
@@ -32,7 +32,7 @@ def _get_agent():
     llm = ChatGroq(temperature=0.0, model_name="llama-3.1-8b-instant", groq_api_key=api_key)
 
     _agent = initialize_agent(
-        [DriveSearchTool(), SearchFolderContentsTool()],
+        [DriveSearchTool(), SearchFolderContentsTool(), DiagnosticTool()],
         llm,
         agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
         memory=_memory,
