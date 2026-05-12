@@ -1,19 +1,17 @@
 import os
-import re
 import logging
-from typing import Any, Dict, List
+from typing import Any
 
 import requests as http
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.agent import chat_with_agent
-from backend.google_drive import DriveRateLimitError
+from backend.google_drive import DriveConfigurationError
 from backend.google_drive import get_drive_service
-from backend.tools import staged_search
 
 load_dotenv()
 logging.basicConfig(
@@ -39,70 +37,13 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
-    files: List[Dict[str, Any]] = []
+    files: list[dict[str, Any]] = Field(default_factory=list)
     tool_used: bool = False
-
-
-def _is_simple_query(text: str) -> bool:
-    """Determine if a query is simple enough to bypass the LLM."""
-    clean = text.lower().strip()
-    words = clean.split()
-    
-    # 1. Single word searches
-    if len(words) == 1:
-        return True
-        
-    # 2. Basic "show/find" patterns
-    patterns = [
-        r"^(show|find|get|search)\s+(only\s+)?(images|pics|pdfs|spreadsheets|sheets|docs|documents|folders|recent|all)$",
-        r"^(show|find|get|search)\s+all\s+files$",
-        r"^(show|find|get|search)\s+(my\s+)?\w+$", # e.g. "find my invoices"
-    ]
-    if any(re.match(p, clean) for p in patterns):
-        return True
-        
-    return False
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    msg = req.message
-    
-    # AGGRESSIVE TOKEN OPTIMIZATION: Bypassing LLM for deterministic queries
-    if _is_simple_query(msg):
-        logger.debug("Direct search intercepted simple query=%r", msg)
-        try:
-            files = staged_search(msg)
-        except DriveRateLimitError:
-            logger.exception("Direct search rate-limited query=%r", msg)
-            return ChatResponse(
-                response="Google Drive is rate-limiting searches right now. Please try again shortly.",
-                files=[],
-                tool_used=True,
-            )
-        except Exception:
-            logger.exception("Direct search failed query=%r", msg)
-            return ChatResponse(
-                response="I couldn't complete that Drive search. Please try again.",
-                files=[],
-                tool_used=True,
-            )
-        if files:
-            count = len(files)
-            return ChatResponse(
-                response=f"I found {count} items matching your search (Direct Mode).",
-                files=files,
-                tool_used=True
-            )
-        else:
-            return ChatResponse(
-                response=f"I couldn't find any files matching '{msg}'.",
-                files=[],
-                tool_used=True
-            )
-
-    # Use LLM for semantic or complex reasoning
-    text, files, tool_used = chat_with_agent(msg)
+    text, files, tool_used = chat_with_agent(req.message)
     return ChatResponse(response=text, files=files, tool_used=tool_used)
 
 
@@ -141,6 +82,9 @@ async def thumbnail(file_id: str):
         )
     except HTTPException:
         raise
+    except DriveConfigurationError:
+        logger.exception("Thumbnail requested before Drive was configured")
+        raise HTTPException(status_code=503, detail="Google Drive is not configured")
     except Exception as e:
         logger.exception("Thumbnail service error file_id=%s", file_id)
         raise HTTPException(status_code=500, detail="Thumbnail service error")

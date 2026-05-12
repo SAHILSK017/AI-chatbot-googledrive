@@ -3,314 +3,464 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Type
 
 from langchain.pydantic_v1 import BaseModel, Field
 from langchain.tools import BaseTool
 
-from backend.google_drive import search_drive
+from backend.google_drive import (
+    FOLDER_MIME,
+    collect_descendant_folder_ids,
+    dedupe_files,
+    drive_quote,
+    search_drive,
+)
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants & Helpers
-# ---------------------------------------------------------------------------
+MAX_RESULT_FILES = int(os.getenv("MAX_RESULT_FILES", "30"))
+MAX_SEARCH_FOLDERS = int(os.getenv("MAX_SEARCH_FOLDERS", "60"))
 
-_STOPWORDS = {
-    "a", "an", "all", "any", "containing", "contains", "contents",
-    "file", "files", "find", "for", "from", "get", "give",
-    "in", "inside", "list", "locate", "me", "my", "named", "of", "only", "open",
-    "please", "related", "search", "show", "that", "the", "with", "within",
-    "called", "just"
+STOPWORDS = {
+    "a", "an", "all", "any", "can", "could", "drive", "file", "files",
+    "find", "for", "from", "get", "give", "google", "in", "inside", "list",
+    "locate", "me", "my", "of", "only", "open", "please", "search", "show",
+    "the", "to", "with", "within", "you",
 }
 
-MIME_INTENTS = {
-    "document": [
-        "application/vnd.google-apps.document",
-        "application/pdf",
-        "application/msword",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ],
+FOLDER_WORDS = {"folder", "folders", "directory", "directories"}
+
+MIME_ALIASES = {
+    "pic": ["image/"],
+    "pics": ["image/"],
+    "picture": ["image/"],
+    "pictures": ["image/"],
+    "photo": ["image/"],
+    "photos": ["image/"],
+    "image": ["image/"],
+    "images": ["image/"],
+    "png": ["image/png"],
+    "jpg": ["image/jpeg"],
+    "jpeg": ["image/jpeg"],
+    "pdf": ["application/pdf"],
+    "pdfs": ["application/pdf"],
     "doc": [
         "application/vnd.google-apps.document",
         "application/pdf",
         "application/msword",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ],
-    "spreadsheet": ["application/vnd.google-apps.spreadsheet"],
-    "sheet": ["application/vnd.google-apps.spreadsheet"],
-    "folder": ["application/vnd.google-apps.folder"],
-    "directory": ["application/vnd.google-apps.folder"],
-    "pdf": ["application/pdf"],
-    "image": ["image/"],
-    "photo": ["image/"],
-    "pic": ["image/"],
-    "png": ["image/png"],
-    "jpg": ["image/jpeg"],
-    "jpeg": ["image/jpeg"],
+    "docs": [
+        "application/vnd.google-apps.document",
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ],
+    "document": [
+        "application/vnd.google-apps.document",
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ],
+    "documents": [
+        "application/vnd.google-apps.document",
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ],
+    "sheet": [
+        "application/vnd.google-apps.spreadsheet",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "text/csv",
+    ],
+    "sheets": [
+        "application/vnd.google-apps.spreadsheet",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "text/csv",
+    ],
+    "spreadsheet": [
+        "application/vnd.google-apps.spreadsheet",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "text/csv",
+    ],
+    "spreadsheets": [
+        "application/vnd.google-apps.spreadsheet",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "text/csv",
+    ],
     "video": ["video/"],
+    "videos": ["video/"],
 }
 
-QUERY_ALIASES = {
-    "pics": "pic",
-    "pictures": "pic",
-    "photos": "photo",
-    "images": "image",
-    "docs": "doc",
-    "documents": "document",
+EXTENSION_ALIASES = {
+    "code": ["py", "java", "js", "jsx", "ts", "tsx", "cpp", "c", "h", "html", "css"],
+    "source": ["py", "java", "js", "jsx", "ts", "tsx", "cpp", "c", "h", "html", "css"],
+    "python": ["py"],
+    "py": ["py"],
+    "java": ["java"],
+    "javascript": ["js", "jsx"],
+    "js": ["js"],
+    "cpp": ["cpp"],
+    "c++": ["cpp"],
+    "csv": ["csv"],
+    "xlsx": ["xlsx"],
+    "xls": ["xls"],
+    "docx": ["docx"],
+}
+
+RECENT_WORDS = {
+    "recent": 14,
+    "latest": 14,
+    "new": 14,
+    "today": 0,
+    "yesterday": 1,
+    "week": 7,
+    "month": 30,
 }
 
 
-def _clean_query(text: str) -> list:
-    """Normalize, remove filler words, and return meaningful keywords."""
-    words = re.findall(r"[a-zA-Z0-9_-]+", text.lower())
-    cleaned = []
-    for word in words:
-        normalized = QUERY_ALIASES.get(word, word)
-        if normalized not in _STOPWORDS and len(normalized) > 1:
-            cleaned.append(normalized)
-    return cleaned
+@dataclass
+class ParsedQuery:
+    raw: str
+    terms: list[str] = field(default_factory=list)
+    folder_terms: list[str] = field(default_factory=list)
+    mime_types: list[str] = field(default_factory=list)
+    extensions: list[str] = field(default_factory=list)
+    modified_after: str | None = None
+    wants_folders: bool = False
+    folder_scoped: bool = False
+    open_intent: bool = False
 
 
-def _drive_quote(value: str) -> str:
-    """Escape a value for use inside a Drive API q string literal."""
-    return value.replace("\\", "\\\\").replace("'", "\\'")
+def _tokens(text: str) -> list[str]:
+    return re.findall(r"[a-zA-Z0-9_+#.-]+", text.lower())
 
 
-def _dedupe_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    deduped: list[dict[str, Any]] = []
-    for file in files:
-        file_id = file.get("id")
-        if not file_id or file_id in seen:
+def _term_variants(term: str) -> list[str]:
+    variants = [term]
+    if term.endswith("ies") and len(term) > 3:
+        variants.append(term[:-3] + "y")
+    if term.endswith("es") and len(term) > 3:
+        variants.append(term[:-2])
+    if term.endswith("s") and len(term) > 2:
+        variants.append(term[:-1])
+    else:
+        variants.append(term + "s")
+    return list(dict.fromkeys(v for v in variants if v))
+
+
+def _add_unique(values: list[str], additions: list[str]) -> None:
+    for value in additions:
+        if value not in values:
+            values.append(value)
+
+
+def _extract_folder_terms(text: str) -> tuple[list[str], bool]:
+    clean = text.lower()
+    patterns = [
+        r"(?:from|in|inside|within)\s+(.+?)\s+(?:folder|directory)\b",
+        r"\b(.+?)\s+(?:folder|directory)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, clean)
+        if not match:
             continue
-        seen.add(file_id)
-        deduped.append(file)
-    return deduped
+        raw = match.group(1)
+        terms = [
+            token for token in _tokens(raw)
+            if token not in STOPWORDS and token not in FOLDER_WORDS
+        ]
+        return terms, True
+    return [], False
 
 
-def _detect_intent(keywords: list) -> dict:
-    """Detect mimeType and date filters from keywords."""
-    intent = {"mimeTypes": [], "modifiedTime": None, "clean_keywords": []}
-    
-    now = datetime.datetime.utcnow()
-    
-    date_map = {
-        "today": now.strftime("%Y-%m-%d"),
-        "yesterday": (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
-        "recent": (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d"),
-        "week": (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d"),
-        "month": (now - datetime.timedelta(days=30)).strftime("%Y-%m-%d"),
-    }
-
-    temp_keywords = []
-    for word in keywords:
-        found_date = False
-        for k, v in date_map.items():
-            if k in word:
-                intent["modifiedTime"] = f"{v}T00:00:00Z"
-                found_date = True
-                break
-        
-        if found_date:
-            continue
-
-        found_mime = False
-        for k, mime_types in MIME_INTENTS.items():
-            # Exact match allowing for plurals
-            if word == k or word == k + "s":
-                for mime_type in mime_types:
-                    if mime_type not in intent["mimeTypes"]:
-                        intent["mimeTypes"].append(mime_type)
-                found_mime = True
-                break
-        
-        # Keep word if it wasn't consumed by intent mapping
-        if not found_mime:
-            temp_keywords.append(word)
-
-    intent["clean_keywords"] = temp_keywords
-    return intent
-
-
-def _similarity(a: str, b: str) -> int:
-    return int(SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100)
-
-
-def staged_search(raw_query: str, folder_id: str = None) -> list:
-    """
-    Intelligent 6-stage search pipeline.
-    """
-    root = folder_id or os.getenv("TARGET_FOLDER_ID")
-    keywords = _clean_query(raw_query)
-    intent = _detect_intent(keywords)
-    clean_kws = intent["clean_keywords"]
-    
-    logger.debug("Search raw_query=%r keywords=%s intent=%s", raw_query, clean_kws, intent)
-
-    def build_q(name_part=None, full_text_part=None):
-        parts = []
-        if name_part:
-            parts.append(name_part)
-        if full_text_part:
-            parts.append(full_text_part)
-        
-        # Robust MIME filtering logic
-        if intent["mimeTypes"]:
-            mime_parts = []
-            for mime_type in intent["mimeTypes"]:
-                if mime_type.endswith("/"):
-                    mime_parts.append(f"mimeType contains '{mime_type}'")
-                else:
-                    mime_parts.append(f"mimeType = '{mime_type}'")
-            parts.append(f"({' or '.join(mime_parts)})" if len(mime_parts) > 1 else mime_parts[0])
-                
-        if intent["modifiedTime"]:
-            parts.append(f"modifiedTime > '{intent['modifiedTime']}'")
-            
-        final_q = " and ".join(parts) if parts else ""
-        return final_q
-
-    # Stage 1: Exact Name Match
-    if clean_kws:
-        name_q = " and ".join([f"name contains '{_drive_quote(k)}'" for k in clean_kws])
-        q = build_q(name_part=name_q)
-        logger.debug("Search stage=precise_name q=%r", q)
-        results = search_drive(q, folder_id=root)
-        if results: 
-            logger.debug("Search stage=precise_name count=%s", len(results))
-            return _dedupe_files(results)
-
-    # Stage 2: Intent Match (e.g. "show image files" where clean_kws is [])
-    if intent["mimeTypes"] or intent["modifiedTime"]:
-        # Execute even if clean_kws is present, as a broader fallback!
-        q = build_q()
-        logger.debug("Search stage=intent q=%r", q)
-        results = search_drive(q, folder_id=root)
-        if results: 
-            logger.debug("Search stage=intent count=%s", len(results))
-            return _dedupe_files(results)
-
-    # Stage 3: Partial Token Match (relaxed)
-    if clean_kws and len(clean_kws) > 1:
-        for kw in clean_kws:
-            q = build_q(name_part=f"name contains '{_drive_quote(kw)}'")
-            logger.debug("Search stage=token keyword=%r q=%r", kw, q)
-            results = search_drive(q, folder_id=root)
-            if results: 
-                logger.debug("Search stage=token count=%s", len(results))
-                return _dedupe_files(results)
-
-    # Stage 4: FullText Search (Inside content)
-    if clean_kws:
-        ft_q = " and ".join([f"fullText contains '{_drive_quote(k)}'" for k in clean_kws])
-        q = build_q(full_text_part=ft_q)
-        logger.debug("Search stage=full_text q=%r", q)
-        results = search_drive(q, folder_id=root)
-        if results: 
-            logger.debug("Search stage=full_text count=%s", len(results))
-            return _dedupe_files(results)
-
-    # Stage 5: Broad FullText (any token)
-    if clean_kws and len(clean_kws) > 1:
-        for kw in clean_kws:
-            q = build_q(full_text_part=f"fullText contains '{_drive_quote(kw)}'")
-            logger.debug("Search stage=broad_full_text keyword=%r q=%r", kw, q)
-            results = search_drive(q, folder_id=root)
-            if results: 
-                logger.debug("Search stage=broad_full_text count=%s", len(results))
-                return _dedupe_files(results)
-
-    # Stage 6: Fuzzy Fallback
-    logger.debug("Search stage=fuzzy")
-    extra_q = build_q()
-    pool = search_drive(extra_q, folder_id=root, page_size=50)
-    if pool and clean_kws:
-        search_target = " ".join(clean_kws)
-        scored = sorted(
-            [(_similarity(search_target, f["name"]), f) for f in pool],
-            key=lambda x: x[0],
-            reverse=True,
-        )
-        matches = [f for score, f in scored if score >= 45]
-        logger.debug("Search stage=fuzzy count=%s", len(matches))
-        return _dedupe_files(matches)
-
-    logger.debug("Search returned no results")
-    return []
-
-
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
-
-class DriveSearchInput(BaseModel):
-    q_parameter: str = Field(
-        description="Natural language search query or Drive API 'q' string."
+def parse_query(raw_query: str) -> ParsedQuery:
+    parsed = ParsedQuery(raw=raw_query.strip())
+    words = _tokens(raw_query)
+    parsed.open_intent = "open" in words
+    parsed.folder_terms, parsed.folder_scoped = _extract_folder_terms(raw_query)
+    parsed.wants_folders = any(word in FOLDER_WORDS for word in words) and not any(
+        marker in words for marker in ["from", "in", "inside", "within"]
     )
 
+    now = datetime.datetime.utcnow()
+    for word in words:
+        if word in FOLDER_WORDS or word in STOPWORDS:
+            continue
+        if word in parsed.folder_terms:
+            continue
+        if word in MIME_ALIASES:
+            _add_unique(parsed.mime_types, MIME_ALIASES[word])
+            continue
+        if word in EXTENSION_ALIASES:
+            _add_unique(parsed.extensions, EXTENSION_ALIASES[word])
+            continue
+        if word in RECENT_WORDS:
+            days = RECENT_WORDS[word]
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            if days:
+                start = now - datetime.timedelta(days=days)
+            parsed.modified_after = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+            continue
+        parsed.terms.append(word)
+
+    if parsed.wants_folders and not parsed.folder_terms:
+        parsed.folder_terms = parsed.terms
+        parsed.terms = []
+
+    parsed.terms = list(dict.fromkeys(parsed.terms))
+    parsed.folder_terms = list(dict.fromkeys(parsed.folder_terms))
+    logger.debug("Parsed query=%r parsed=%s", raw_query, parsed)
+    return parsed
+
+
+def _mime_clause(mime_types: list[str]) -> str | None:
+    if not mime_types:
+        return None
+    parts = []
+    for mime_type in mime_types:
+        if mime_type.endswith("/"):
+            parts.append(f"mimeType contains '{drive_quote(mime_type)}'")
+        else:
+            parts.append(f"mimeType = '{drive_quote(mime_type)}'")
+    return f"({' or '.join(parts)})" if len(parts) > 1 else parts[0]
+
+
+def _extension_clause(extensions: list[str]) -> str | None:
+    if not extensions:
+        return None
+    parts = [f"name contains '.{drive_quote(ext.lstrip('.'))}'" for ext in extensions]
+    return f"({' or '.join(parts)})" if len(parts) > 1 else parts[0]
+
+
+def _term_clause(terms: list[str], field_name: str = "name", mode: str = "and") -> str | None:
+    if not terms:
+        return None
+    parts = []
+    for term in terms:
+        variants = _term_variants(term)
+        variant_parts = [f"{field_name} contains '{drive_quote(variant)}'" for variant in variants]
+        parts.append(f"({' or '.join(variant_parts)})" if len(variant_parts) > 1 else variant_parts[0])
+    joiner = " and " if mode == "and" else " or "
+    return f"({joiner.join(parts)})" if len(parts) > 1 else parts[0]
+
+
+def _build_query(
+    parsed: ParsedQuery,
+    terms: list[str] | None = None,
+    term_field: str = "name",
+    term_mode: str = "and",
+    folders_only: bool = False,
+    include_type_filters: bool = True,
+) -> str:
+    clauses: list[str] = []
+    if folders_only:
+        clauses.append(f"mimeType = '{FOLDER_MIME}'")
+    elif include_type_filters:
+        mime = _mime_clause(parsed.mime_types)
+        ext = _extension_clause(parsed.extensions)
+        type_parts = [part for part in [mime, ext] if part]
+        if len(type_parts) > 1:
+            clauses.append(f"({' or '.join(type_parts)})")
+        elif type_parts:
+            clauses.append(type_parts[0])
+
+    selected_terms = parsed.terms if terms is None else terms
+    term_filter = _term_clause(selected_terms, field_name=term_field, mode=term_mode)
+    if term_filter:
+        clauses.append(term_filter)
+    if parsed.modified_after:
+        clauses.append(f"modifiedTime >= '{parsed.modified_after}'")
+    return " and ".join(clauses)
+
+
+def _search_many_folders(
+    query: str,
+    folder_ids: list[str] | None,
+    per_folder_limit: int = MAX_RESULT_FILES,
+) -> list[dict[str, Any]]:
+    if folder_ids:
+        files: list[dict[str, Any]] = []
+        for folder_id in folder_ids[:MAX_SEARCH_FOLDERS]:
+            remaining = max(MAX_RESULT_FILES - len(files), 1)
+            files.extend(search_drive(query=query, folder_id=folder_id, page_size=min(per_folder_limit, remaining)))
+            if len(files) >= MAX_RESULT_FILES:
+                break
+        return dedupe_files(files)[:MAX_RESULT_FILES]
+    return search_drive(query=query, page_size=MAX_RESULT_FILES)
+
+
+def _folder_scope(root_folder_id: str | None) -> list[str] | None:
+    if not root_folder_id:
+        return None
+    return collect_descendant_folder_ids(root_folder_id, max_folders=MAX_SEARCH_FOLDERS)
+
+
+def _score_terms(terms: list[str], name: str) -> int:
+    if not terms:
+        return 100
+    target = " ".join(terms)
+    lower_name = name.lower()
+    contains_bonus = sum(25 for term in terms if any(v in lower_name for v in _term_variants(term)))
+    ratio = int(SequenceMatcher(None, target, lower_name).ratio() * 100)
+    return min(100, ratio + contains_bonus)
+
+
+def _local_filter(files: list[dict[str, Any]], parsed: ParsedQuery) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for file in files:
+        name = file.get("name", "").lower()
+        mime = file.get("mimeType", "").lower()
+        if parsed.mime_types and not any(
+            mime.startswith(m[:-1]) if m.endswith("/") else mime == m
+            for m in parsed.mime_types
+        ):
+            continue
+        if parsed.extensions and not any(name.endswith("." + ext.lstrip(".").lower()) for ext in parsed.extensions):
+            continue
+        if parsed.terms and _score_terms(parsed.terms, name) < 45:
+            continue
+        filtered.append(file)
+    return filtered
+
+
+def find_matching_folders(parsed: ParsedQuery, root_folder_id: str | None = None) -> list[dict[str, Any]]:
+    terms = parsed.folder_terms or parsed.terms
+    folder_query = _build_query(parsed, terms=terms, folders_only=True, include_type_filters=False)
+
+    folder_ids = _folder_scope(root_folder_id)
+    if folder_ids:
+        folders = _search_many_folders(folder_query, folder_ids, per_folder_limit=20)
+        if folders:
+            return folders
+        all_folders = _search_many_folders(
+            f"mimeType = '{FOLDER_MIME}'",
+            folder_ids,
+            per_folder_limit=100,
+        )
+        return [
+            folder for folder in all_folders
+            if _score_terms(terms, folder.get("name", "")) >= 45
+        ][:MAX_RESULT_FILES]
+
+    folders = search_drive(query=folder_query, page_size=MAX_RESULT_FILES)
+    if folders:
+        return folders
+
+    # Global fuzzy fallback for plural/singular mismatches.
+    all_folders = search_drive(query=f"mimeType = '{FOLDER_MIME}'", page_size=100)
+    return [
+        folder for folder in all_folders
+        if _score_terms(terms, folder.get("name", "")) >= 45
+    ][:MAX_RESULT_FILES]
+
+
+def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str, Any]]:
+    """Deterministic, recursive Drive search used by both API and tools."""
+    root = folder_id or os.getenv("TARGET_FOLDER_ID")
+    parsed = parse_query(raw_query)
+
+    if parsed.wants_folders:
+        return dedupe_files(find_matching_folders(parsed, root))[:MAX_RESULT_FILES]
+
+    scope_folder_ids: list[str] | None = None
+    if parsed.folder_scoped and parsed.folder_terms:
+        folders = find_matching_folders(parsed, root)
+        scope_folder_ids = []
+        for folder in folders[:5]:
+            folder_id = folder.get("id")
+            if folder_id:
+                scope_folder_ids.extend(collect_descendant_folder_ids(folder_id, max_folders=MAX_SEARCH_FOLDERS))
+        scope_folder_ids = list(dict.fromkeys(scope_folder_ids))
+        if not scope_folder_ids:
+            logger.debug("No matching folders found for scoped query=%r", raw_query)
+            return []
+    elif root:
+        scope_folder_ids = _folder_scope(root)
+
+    stages = [
+        ("name_all", _build_query(parsed, term_field="name", term_mode="and")),
+        ("type_or_recent", _build_query(parsed, terms=[], term_field="name")),
+        ("name_any", _build_query(parsed, term_field="name", term_mode="or")),
+        ("fulltext_all", _build_query(parsed, term_field="fullText", term_mode="and")),
+        ("fulltext_any", _build_query(parsed, term_field="fullText", term_mode="or")),
+    ]
+
+    for stage_name, query in stages:
+        if not query:
+            continue
+        logger.debug("Search stage=%s query=%r folders=%s", stage_name, query, len(scope_folder_ids or []))
+        results = _search_many_folders(query, scope_folder_ids)
+        if results:
+            return results
+
+    # Final fallback: list visible scope and fuzzy-filter locally.
+    logger.debug("Search stage=fuzzy_list folders=%s", len(scope_folder_ids or []))
+    pool = _search_many_folders("", scope_folder_ids, per_folder_limit=100)
+    matches = _local_filter(pool, parsed)
+    scored = sorted(
+        [(_score_terms(parsed.terms, file.get("name", "")), file) for file in matches],
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    return dedupe_files([file for score, file in scored if score >= 45 or not parsed.terms])[:MAX_RESULT_FILES]
+
+
+class DriveSearchInput(BaseModel):
+    query: str = Field(description="Natural language Google Drive search query.")
+
+
 class DriveSearchTool(BaseTool):
-    name = "google_drive_search"
-    description = (
-        "Search files in Google Drive. You can provide natural language like "
-        "'find invoice pdf' or 'show images'."
+    name: str = "google_drive_search"
+    description: str = (
+        "Search Google Drive deterministically. Use this for every request to find, "
+        "show, open, list, filter, or search files/folders."
     )
     args_schema: Type[BaseModel] = DriveSearchInput
 
-    def _run(self, q_parameter: str) -> str:
-        root = os.getenv("TARGET_FOLDER_ID")
+    def _run(self, query: str) -> str:
         try:
-            is_q_param = "=" in q_parameter or "contains" in q_parameter
-            
-            if is_q_param:
-                results = search_drive(query=q_parameter, folder_id=root)
-                if results:
-                    return json.dumps({"files": results})
+            files = staged_search(query)
+            return json.dumps({"files": files, "count": len(files)})
+        except Exception as exc:
+            logger.exception("google_drive_search failed query=%r", query)
+            return json.dumps({"files": [], "error": str(exc)})
 
-            results = staged_search(q_parameter, folder_id=root)
-            
-            if not results:
-                return json.dumps({"error": f"No files found for '{q_parameter}'.", "files": []})
-            
-            return json.dumps({"files": results})
-        except Exception as e:
-            logger.exception("google_drive_search tool failed query=%r", q_parameter)
-            return json.dumps({"error": str(e), "files": []})
+    async def _arun(self, query: str) -> str:
+        return self._run(query)
 
-    def _arun(self, q_parameter: str):
-        raise NotImplementedError
 
-class FolderSearchInput(BaseModel):
-    folder_name: str = Field(
-        description="Name of the folder to look inside. E.g. 'invoices' or 'pics'."
-    )
+class FolderContentsInput(BaseModel):
+    folder_name: str = Field(description="Folder name to find and list recursively.")
+
 
 class SearchFolderContentsTool(BaseTool):
-    name = "search_folder_contents"
-    description = "List files inside a specific folder by name."
-    args_schema: Type[BaseModel] = FolderSearchInput
+    name: str = "search_folder_contents"
+    description: str = "Find a folder by name and list its recursive contents."
+    args_schema: Type[BaseModel] = FolderContentsInput
 
     def _run(self, folder_name: str) -> str:
         try:
-            root = os.getenv("TARGET_FOLDER_ID")
-            # Directly query for the folder by name and mimeType to avoid intent stripping
-            q = f"name contains '{_drive_quote(folder_name)}' and mimeType = 'application/vnd.google-apps.folder'"
-            folders = search_drive(q, folder_id=root)
-            
-            if not folders:
-                return json.dumps({"error": f"Folder '{folder_name}' not found.", "files": []})
+            parsed = parse_query(folder_name if "folder" in folder_name.lower() else f"{folder_name} folder")
+            folders = find_matching_folders(parsed, os.getenv("TARGET_FOLDER_ID"))
+            files: list[dict[str, Any]] = []
+            for folder in folders[:5]:
+                folder_id = folder.get("id")
+                if not folder_id:
+                    continue
+                for descendant_id in collect_descendant_folder_ids(folder_id, max_folders=MAX_SEARCH_FOLDERS):
+                    files.extend(search_drive(folder_id=descendant_id, page_size=MAX_RESULT_FILES))
+            files = dedupe_files(files)[:MAX_RESULT_FILES]
+            return json.dumps({"files": files, "count": len(files)})
+        except Exception as exc:
+            logger.exception("search_folder_contents failed folder=%r", folder_name)
+            return json.dumps({"files": [], "error": str(exc)})
 
-            folder = folders[0]
-            files = search_drive(query=f"'{folder['id']}' in parents", folder_id=None)
-            
-            if not files:
-                return json.dumps({"error": f"Folder '{folder['name']}' is empty.", "files": []})
-
-            return json.dumps({"files": files})
-        except Exception as e:
-            logger.exception("search_folder_contents tool failed folder=%r", folder_name)
-            return json.dumps({"error": str(e), "files": []})
-
-    def _arun(self, folder_name: str):
-        raise NotImplementedError
+    async def _arun(self, folder_name: str) -> str:
+        return self._run(folder_name)
