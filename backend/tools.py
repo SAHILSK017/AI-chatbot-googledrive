@@ -14,10 +14,11 @@ from backend.google_drive import search_drive
 # ---------------------------------------------------------------------------
 
 _STOPWORDS = {
-    "a", "an", "all", "any", "containing", "contents", "directory", "file", 
-    "files", "find", "folder", "get", "give", "in", "inside", "list", "locate",
-    "me", "my", "named", "of", "open", "please", "related", "search", "show", 
-    "the", "within",
+    "a", "an", "all", "any", "containing", "contains", "contents", "directory",
+    "file", "files", "find", "folder", "folders", "for", "from", "get", "give",
+    "in", "inside", "list", "locate", "me", "my", "named", "of", "only", "open",
+    "please", "related", "search", "show", "that", "the", "with", "within",
+    "document", "documents", "image", "images", "called",
 }
 
 MIME_INTENTS = {
@@ -130,11 +131,12 @@ def staged_search(raw_query: str, folder_id: str = None) -> list:
         results = search_drive(q, folder_id=root)
         if results: return results
 
-    # Stage 2: Intent Match (e.g. "find documents")
-    if not clean_kws and (intent["mimeType"] or intent["modifiedTime"]):
+    # Stage 2: Intent Match (e.g. "show images", "find documents")
+    # Runs when MIME/date intent was detected but no other keywords remain
+    if (not clean_kws) and (intent["mimeType"] or intent["modifiedTime"]):
         q = build_q()
         print(f"[search_stage] 2. Intent Only: {q}", flush=True)
-        results = search_drive(q, folder_id=root)
+        results = search_drive(q, folder_id=None)  # Always global for intent-only
         if results: return results
 
     # Stage 3: Partial Token Match (relaxed)
@@ -211,7 +213,8 @@ class DriveSearchTool(BaseTool):
                     return json.dumps({"files": results})
 
             # If empty or natural language, use staged search
-            results = staged_search(q_parameter, folder_id=root)
+            # For intent-only queries (images/sheets/etc), always search globally
+            results = staged_search(q_parameter, folder_id=None)
             
             if not results:
                 return json.dumps({"error": f"No files found for '{q_parameter}'.", "files": []})
