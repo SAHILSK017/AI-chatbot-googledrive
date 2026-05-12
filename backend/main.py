@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 from typing import Any, Dict, List
 
 import requests as http
@@ -10,10 +11,16 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from backend.agent import chat_with_agent
+from backend.google_drive import DriveRateLimitError
 from backend.google_drive import get_drive_service
 from backend.tools import staged_search
 
 load_dotenv()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Drive Agent API")
 
@@ -63,8 +70,23 @@ async def chat(req: ChatRequest):
     
     # AGGRESSIVE TOKEN OPTIMIZATION: Bypassing LLM for deterministic queries
     if _is_simple_query(msg):
-        print(f"[direct_search] Intercepted simple query: '{msg}'", flush=True)
-        files = staged_search(msg)
+        logger.debug("Direct search intercepted simple query=%r", msg)
+        try:
+            files = staged_search(msg)
+        except DriveRateLimitError:
+            logger.exception("Direct search rate-limited query=%r", msg)
+            return ChatResponse(
+                response="Google Drive is rate-limiting searches right now. Please try again shortly.",
+                files=[],
+                tool_used=True,
+            )
+        except Exception:
+            logger.exception("Direct search failed query=%r", msg)
+            return ChatResponse(
+                response="I couldn't complete that Drive search. Please try again.",
+                files=[],
+                tool_used=True,
+            )
         if files:
             count = len(files)
             return ChatResponse(
@@ -120,7 +142,7 @@ async def thumbnail(file_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[thumbnail] {file_id}: {e}", flush=True)
+        logger.exception("Thumbnail service error file_id=%s", file_id)
         raise HTTPException(status_code=500, detail="Thumbnail service error")
 
 

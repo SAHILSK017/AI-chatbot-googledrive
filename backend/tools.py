@@ -1,13 +1,17 @@
 import datetime
 import json
+import logging
 import os
+import re
 from difflib import SequenceMatcher
-from typing import Type
+from typing import Any, Type
 
 from langchain.pydantic_v1 import BaseModel, Field
 from langchain.tools import BaseTool
 
 from backend.google_drive import search_drive
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants & Helpers
@@ -22,29 +26,73 @@ _STOPWORDS = {
 }
 
 MIME_INTENTS = {
-    "document": "application/vnd.google-apps.document",
-    "doc": "application/vnd.google-apps.document",
-    "spreadsheet": "application/vnd.google-apps.spreadsheet",
-    "sheet": "application/vnd.google-apps.spreadsheet",
-    "folder": "application/vnd.google-apps.folder",
-    "directory": "application/vnd.google-apps.folder",
-    "pdf": "application/pdf",
-    "image": "image/",
-    "photo": "image/",
-    "pic": "image/",
-    "video": "video/",
+    "document": [
+        "application/vnd.google-apps.document",
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ],
+    "doc": [
+        "application/vnd.google-apps.document",
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ],
+    "spreadsheet": ["application/vnd.google-apps.spreadsheet"],
+    "sheet": ["application/vnd.google-apps.spreadsheet"],
+    "folder": ["application/vnd.google-apps.folder"],
+    "directory": ["application/vnd.google-apps.folder"],
+    "pdf": ["application/pdf"],
+    "image": ["image/"],
+    "photo": ["image/"],
+    "pic": ["image/"],
+    "png": ["image/png"],
+    "jpg": ["image/jpeg"],
+    "jpeg": ["image/jpeg"],
+    "video": ["video/"],
+}
+
+QUERY_ALIASES = {
+    "pics": "pic",
+    "pictures": "pic",
+    "photos": "photo",
+    "images": "image",
+    "docs": "doc",
+    "documents": "document",
 }
 
 
 def _clean_query(text: str) -> list:
     """Normalize, remove filler words, and return meaningful keywords."""
-    words = text.lower().replace("'", "").replace('"', "").split()
-    return [w for w in words if w not in _STOPWORDS and len(w) > 1]
+    words = re.findall(r"[a-zA-Z0-9_-]+", text.lower())
+    cleaned = []
+    for word in words:
+        normalized = QUERY_ALIASES.get(word, word)
+        if normalized not in _STOPWORDS and len(normalized) > 1:
+            cleaned.append(normalized)
+    return cleaned
+
+
+def _drive_quote(value: str) -> str:
+    """Escape a value for use inside a Drive API q string literal."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _dedupe_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for file in files:
+        file_id = file.get("id")
+        if not file_id or file_id in seen:
+            continue
+        seen.add(file_id)
+        deduped.append(file)
+    return deduped
 
 
 def _detect_intent(keywords: list) -> dict:
     """Detect mimeType and date filters from keywords."""
-    intent = {"mimeType": None, "modifiedTime": None, "clean_keywords": []}
+    intent = {"mimeTypes": [], "modifiedTime": None, "clean_keywords": []}
     
     now = datetime.datetime.utcnow()
     
@@ -69,10 +117,12 @@ def _detect_intent(keywords: list) -> dict:
             continue
 
         found_mime = False
-        for k, v in MIME_INTENTS.items():
+        for k, mime_types in MIME_INTENTS.items():
             # Exact match allowing for plurals
             if word == k or word == k + "s":
-                intent["mimeType"] = v
+                for mime_type in mime_types:
+                    if mime_type not in intent["mimeTypes"]:
+                        intent["mimeTypes"].append(mime_type)
                 found_mime = True
                 break
         
@@ -97,9 +147,7 @@ def staged_search(raw_query: str, folder_id: str = None) -> list:
     intent = _detect_intent(keywords)
     clean_kws = intent["clean_keywords"]
     
-    print(f"\n[search_debug] Raw Query: '{raw_query}'", flush=True)
-    print(f"[search_debug] Extracted Keywords: {clean_kws}", flush=True)
-    print(f"[search_debug] Detected Intent: MIME={intent['mimeType']}, Date={intent['modifiedTime']}", flush=True)
+    logger.debug("Search raw_query=%r keywords=%s intent=%s", raw_query, clean_kws, intent)
 
     def build_q(name_part=None, full_text_part=None):
         parts = []
@@ -109,11 +157,14 @@ def staged_search(raw_query: str, folder_id: str = None) -> list:
             parts.append(full_text_part)
         
         # Robust MIME filtering logic
-        if intent["mimeType"]:
-            if intent["mimeType"].endswith("/"):
-                parts.append(f"mimeType contains '{intent['mimeType']}'")
-            else:
-                parts.append(f"mimeType = '{intent['mimeType']}'")
+        if intent["mimeTypes"]:
+            mime_parts = []
+            for mime_type in intent["mimeTypes"]:
+                if mime_type.endswith("/"):
+                    mime_parts.append(f"mimeType contains '{mime_type}'")
+                else:
+                    mime_parts.append(f"mimeType = '{mime_type}'")
+            parts.append(f"({' or '.join(mime_parts)})" if len(mime_parts) > 1 else mime_parts[0])
                 
         if intent["modifiedTime"]:
             parts.append(f"modifiedTime > '{intent['modifiedTime']}'")
@@ -123,56 +174,56 @@ def staged_search(raw_query: str, folder_id: str = None) -> list:
 
     # Stage 1: Exact Name Match
     if clean_kws:
-        name_q = " and ".join([f"name contains '{k}'" for k in clean_kws])
+        name_q = " and ".join([f"name contains '{_drive_quote(k)}'" for k in clean_kws])
         q = build_q(name_part=name_q)
-        print(f"[search_stage] 1. Precise Name: {q}", flush=True)
+        logger.debug("Search stage=precise_name q=%r", q)
         results = search_drive(q, folder_id=root)
         if results: 
-            print(f"[search_debug] Results Count: {len(results)}", flush=True)
-            return results
+            logger.debug("Search stage=precise_name count=%s", len(results))
+            return _dedupe_files(results)
 
     # Stage 2: Intent Match (e.g. "show image files" where clean_kws is [])
-    if intent["mimeType"] or intent["modifiedTime"]:
+    if intent["mimeTypes"] or intent["modifiedTime"]:
         # Execute even if clean_kws is present, as a broader fallback!
         q = build_q()
-        print(f"[search_stage] 2. Intent-Based Fallback: {q}", flush=True)
+        logger.debug("Search stage=intent q=%r", q)
         results = search_drive(q, folder_id=root)
         if results: 
-            print(f"[search_debug] Results Count: {len(results)}", flush=True)
-            return results
+            logger.debug("Search stage=intent count=%s", len(results))
+            return _dedupe_files(results)
 
     # Stage 3: Partial Token Match (relaxed)
     if clean_kws and len(clean_kws) > 1:
         for kw in clean_kws:
-            q = build_q(name_part=f"name contains '{kw}'")
-            print(f"[search_stage] 3. Token '{kw}': {q}", flush=True)
+            q = build_q(name_part=f"name contains '{_drive_quote(kw)}'")
+            logger.debug("Search stage=token keyword=%r q=%r", kw, q)
             results = search_drive(q, folder_id=root)
             if results: 
-                print(f"[search_debug] Results Count: {len(results)}", flush=True)
-                return results
+                logger.debug("Search stage=token count=%s", len(results))
+                return _dedupe_files(results)
 
     # Stage 4: FullText Search (Inside content)
     if clean_kws:
-        ft_q = " and ".join([f"fullText contains '{k}'" for k in clean_kws])
+        ft_q = " and ".join([f"fullText contains '{_drive_quote(k)}'" for k in clean_kws])
         q = build_q(full_text_part=ft_q)
-        print(f"[search_stage] 4. FullText: {q}", flush=True)
+        logger.debug("Search stage=full_text q=%r", q)
         results = search_drive(q, folder_id=root)
         if results: 
-            print(f"[search_debug] Results Count: {len(results)}", flush=True)
-            return results
+            logger.debug("Search stage=full_text count=%s", len(results))
+            return _dedupe_files(results)
 
     # Stage 5: Broad FullText (any token)
     if clean_kws and len(clean_kws) > 1:
         for kw in clean_kws:
-            q = build_q(full_text_part=f"fullText contains '{kw}'")
-            print(f"[search_stage] 5. Broad FullText '{kw}': {q}", flush=True)
+            q = build_q(full_text_part=f"fullText contains '{_drive_quote(kw)}'")
+            logger.debug("Search stage=broad_full_text keyword=%r q=%r", kw, q)
             results = search_drive(q, folder_id=root)
             if results: 
-                print(f"[search_debug] Results Count: {len(results)}", flush=True)
-                return results
+                logger.debug("Search stage=broad_full_text count=%s", len(results))
+                return _dedupe_files(results)
 
     # Stage 6: Fuzzy Fallback
-    print(f"[search_stage] 6. Fuzzy Fallback", flush=True)
+    logger.debug("Search stage=fuzzy")
     extra_q = build_q()
     pool = search_drive(extra_q, folder_id=root, page_size=50)
     if pool and clean_kws:
@@ -183,10 +234,10 @@ def staged_search(raw_query: str, folder_id: str = None) -> list:
             reverse=True,
         )
         matches = [f for score, f in scored if score >= 45]
-        print(f"[search_debug] Results Count: {len(matches)}", flush=True)
-        return matches
+        logger.debug("Search stage=fuzzy count=%s", len(matches))
+        return _dedupe_files(matches)
 
-    print(f"[search_debug] Results Count: 0", flush=True)
+    logger.debug("Search returned no results")
     return []
 
 
@@ -224,6 +275,7 @@ class DriveSearchTool(BaseTool):
             
             return json.dumps({"files": results})
         except Exception as e:
+            logger.exception("google_drive_search tool failed query=%r", q_parameter)
             return json.dumps({"error": str(e), "files": []})
 
     def _arun(self, q_parameter: str):
@@ -243,7 +295,7 @@ class SearchFolderContentsTool(BaseTool):
         try:
             root = os.getenv("TARGET_FOLDER_ID")
             # Directly query for the folder by name and mimeType to avoid intent stripping
-            q = f"name contains '{folder_name}' and mimeType = 'application/vnd.google-apps.folder'"
+            q = f"name contains '{_drive_quote(folder_name)}' and mimeType = 'application/vnd.google-apps.folder'"
             folders = search_drive(q, folder_id=root)
             
             if not folders:
@@ -257,6 +309,7 @@ class SearchFolderContentsTool(BaseTool):
 
             return json.dumps({"files": files})
         except Exception as e:
+            logger.exception("search_folder_contents tool failed folder=%r", folder_name)
             return json.dumps({"error": str(e), "files": []})
 
     def _arun(self, folder_name: str):
