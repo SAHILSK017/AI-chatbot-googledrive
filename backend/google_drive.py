@@ -2,10 +2,14 @@ import base64
 import json
 import logging
 import os
+import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import httplib2
+from google_auth_httplib2 import AuthorizedHttp
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -21,6 +25,8 @@ DRIVE_FIELDS = (
     ")"
 )
 FOLDER_MIME = "application/vnd.google-apps.folder"
+DRIVE_API_TIMEOUT_SECONDS = int(os.getenv("DRIVE_API_TIMEOUT_SECONDS", "20"))
+_drive_http_lock = threading.RLock()
 
 
 class DriveConfigurationError(RuntimeError):
@@ -143,8 +149,15 @@ def _load_credentials():
 
 @lru_cache(maxsize=1)
 def get_drive_service():
+    logger.info("Loading Google Drive service")
     credentials = _load_credentials()
-    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+    authed_http = AuthorizedHttp(
+        credentials,
+        http=httplib2.Http(timeout=DRIVE_API_TIMEOUT_SECONDS),
+    )
+    service = build("drive", "v3", http=authed_http, cache_discovery=False)
+    logger.info("Google Drive service loaded and cached")
+    return service
 
 
 def drive_quote(value: str) -> str:
@@ -171,32 +184,54 @@ def search_drive(
 ) -> list[dict[str, Any]]:
     """Execute a Drive files.list query and return normalized, deduped files."""
     q = _with_default_filters(query, folder_id)
-    logger.debug("Drive search q=%r page_size=%s", q, page_size)
+    started = time.monotonic()
+    logger.info(
+        "Google Drive search started q=%r folder_id=%s page_size=%s order_by=%s",
+        q,
+        folder_id,
+        page_size,
+        order_by,
+    )
 
     try:
         service = get_drive_service()
         files: list[dict[str, Any]] = []
         page_token = None
         remaining = max(page_size, 1)
+        page_number = 0
 
         while remaining > 0:
+            page_number += 1
             batch_size = min(remaining, 100)
-            response = (
-                service.files()
-                .list(
-                    q=q,
-                    pageSize=batch_size,
-                    pageToken=page_token,
-                    fields=DRIVE_FIELDS,
-                    orderBy=order_by,
-                    includeItemsFromAllDrives=True,
-                    supportsAllDrives=True,
-                )
-                .execute()
+            logger.debug(
+                "Google Drive list page=%s batch_size=%s remaining=%s",
+                page_number,
+                batch_size,
+                remaining,
             )
+            with _drive_http_lock:
+                response = (
+                    service.files()
+                    .list(
+                        q=q,
+                        pageSize=batch_size,
+                        pageToken=page_token,
+                        fields=DRIVE_FIELDS,
+                        orderBy=order_by,
+                        includeItemsFromAllDrives=True,
+                        supportsAllDrives=True,
+                    )
+                    .execute()
+                )
             files.extend(_normalize_file(file) for file in response.get("files", []))
             page_token = response.get("nextPageToken")
             remaining = page_size - len(files)
+            logger.debug(
+                "Google Drive list page complete page=%s returned=%s has_next=%s",
+                page_number,
+                len(response.get("files", [])),
+                bool(page_token),
+            )
             if not page_token:
                 break
 
@@ -214,7 +249,11 @@ def search_drive(
         raise
 
     deduped = dedupe_files(files)
-    logger.debug("Drive search returned count=%s", len(deduped))
+    logger.info(
+        "Google Drive search complete count=%s duration_ms=%s",
+        len(deduped),
+        int((time.monotonic() - started) * 1000),
+    )
     return deduped
 
 
@@ -224,6 +263,7 @@ def collect_descendant_folder_ids(
     max_folders: int = 60,
 ) -> list[str]:
     """Breadth-first traversal used for reliable scoped search."""
+    logger.info("Collecting descendant folders root=%s max=%s", root_folder_id, max_folders)
     folder_ids = [root_folder_id]
     queue = [root_folder_id]
     seen = {root_folder_id}
@@ -245,7 +285,7 @@ def collect_descendant_folder_ids(
             if len(folder_ids) >= max_folders:
                 break
 
-    logger.debug("Collected descendant folders count=%s root=%s", len(folder_ids), root_folder_id)
+    logger.info("Collected descendant folders count=%s root=%s", len(folder_ids), root_folder_id)
     return folder_ids
 
 

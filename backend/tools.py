@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Type
@@ -309,6 +310,12 @@ def _search_many_folders(
     folder_ids: list[str] | None,
     per_folder_limit: int = MAX_RESULT_FILES,
 ) -> list[dict[str, Any]]:
+    logger.info(
+        "Vector/search layer executing query=%r scoped_folders=%s per_folder_limit=%s",
+        query,
+        len(folder_ids or []),
+        per_folder_limit,
+    )
     if folder_ids:
         files: list[dict[str, Any]] = []
         for folder_id in folder_ids[:MAX_SEARCH_FOLDERS]:
@@ -322,8 +329,12 @@ def _search_many_folders(
             )
             if len(files) >= MAX_RESULT_FILES:
                 break
-        return dedupe_files(files)[:MAX_RESULT_FILES]
-    return search_drive(query=query, page_size=MAX_RESULT_FILES)
+        results = dedupe_files(files)[:MAX_RESULT_FILES]
+        logger.info("Scoped search complete count=%s", len(results))
+        return results
+    results = search_drive(query=query, page_size=MAX_RESULT_FILES)
+    logger.info("Global search complete count=%s", len(results))
+    return results
 
 
 def _folder_scope(root_folder_id: str | None) -> list[str] | None:
@@ -361,6 +372,7 @@ def _local_filter(files: list[dict[str, Any]], parsed: ParsedQuery) -> list[dict
 
 
 def find_matching_folders(parsed: ParsedQuery, root_folder_id: str | None = None) -> list[dict[str, Any]]:
+    logger.info("Folder matching started terms=%s root=%s", parsed.folder_terms or parsed.terms, root_folder_id)
     terms = parsed.folder_terms or parsed.terms
     folder_query = _build_query(parsed, terms=terms, folders_only=True, include_type_filters=False)
 
@@ -381,6 +393,7 @@ def find_matching_folders(parsed: ParsedQuery, root_folder_id: str | None = None
 
     folders = search_drive(query=folder_query, page_size=MAX_RESULT_FILES)
     if folders:
+        logger.info("Folder matching complete count=%s", len(folders))
         return folders
 
     # Global fuzzy fallback for plural/singular mismatches.
@@ -393,11 +406,19 @@ def find_matching_folders(parsed: ParsedQuery, root_folder_id: str | None = None
 
 def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str, Any]]:
     """Deterministic, recursive Drive search used by both API and tools."""
+    started = time.monotonic()
     root = folder_id or os.getenv("TARGET_FOLDER_ID")
     parsed = parse_query(raw_query)
+    logger.info("Staged Drive search started query=%r root=%s", raw_query[:500], root)
 
     if parsed.wants_folders:
-        return dedupe_files(find_matching_folders(parsed, root))[:MAX_RESULT_FILES]
+        results = dedupe_files(find_matching_folders(parsed, root))[:MAX_RESULT_FILES]
+        logger.info(
+            "Staged Drive folder search complete count=%s duration_ms=%s",
+            len(results),
+            int((time.monotonic() - started) * 1000),
+        )
+        return results
 
     scope_folder_ids: list[str] | None = None
     if parsed.folder_scoped and parsed.folder_terms:
@@ -415,6 +436,7 @@ def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str
         scope_folder_ids = list(dict.fromkeys(scope_folder_ids))
         if not scope_folder_ids:
             logger.debug("No matching folders found for scoped query=%r", raw_query)
+            logger.info("Staged Drive search stopped: no matching scope folders")
             return []
     elif root:
         scope_folder_ids = _folder_scope(root)
@@ -430,13 +452,20 @@ def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str
     for stage_name, query in stages:
         if not query:
             continue
-        logger.debug("Search stage=%s query=%r folders=%s", stage_name, query, len(scope_folder_ids or []))
+        logger.info("Search stage started stage=%s query=%r folders=%s", stage_name, query, len(scope_folder_ids or []))
         results = _search_many_folders(query, scope_folder_ids)
         if results:
+            logger.info(
+                "Search stage succeeded stage=%s count=%s duration_ms=%s",
+                stage_name,
+                len(results),
+                int((time.monotonic() - started) * 1000),
+            )
             return results
+        logger.info("Search stage empty stage=%s", stage_name)
 
     # Final fallback: list visible scope and fuzzy-filter locally.
-    logger.debug("Search stage=fuzzy_list folders=%s", len(scope_folder_ids or []))
+    logger.info("Search stage started stage=fuzzy_list folders=%s", len(scope_folder_ids or []))
     pool = _search_many_folders("", scope_folder_ids, per_folder_limit=100)
     matches = _local_filter(pool, parsed)
     scored = sorted(
@@ -444,7 +473,13 @@ def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str
         key=lambda item: item[0],
         reverse=True,
     )
-    return dedupe_files([file for score, file in scored if score >= 45 or not parsed.terms])[:MAX_RESULT_FILES]
+    results = dedupe_files([file for score, file in scored if score >= 45 or not parsed.terms])[:MAX_RESULT_FILES]
+    logger.info(
+        "Staged Drive search complete stage=fuzzy_list count=%s duration_ms=%s",
+        len(results),
+        int((time.monotonic() - started) * 1000),
+    )
+    return results
 
 
 class DriveSearchInput(BaseModel):
@@ -458,7 +493,9 @@ class DriveSearchTool(BaseTool):
 
     def _run(self, query: str) -> str:
         try:
+            logger.info("Tool google_drive_search started query=%r", query[:500])
             files = staged_search(query)
+            logger.info("Tool google_drive_search complete count=%s", len(files))
             return json.dumps({"files": _compact_tool_files(files), "count": len(files)})
         except Exception as exc:
             logger.exception("google_drive_search failed query=%r", query)
@@ -479,6 +516,7 @@ class SearchFolderContentsTool(BaseTool):
 
     def _run(self, folder_name: str) -> str:
         try:
+            logger.info("Tool search_folder_contents started folder=%r", folder_name[:500])
             query = folder_name if "folder" in folder_name.lower() else f"{folder_name} folder"
             parsed = parse_query(query)
             folders = find_matching_folders(parsed, os.getenv("TARGET_FOLDER_ID"))
@@ -496,6 +534,7 @@ class SearchFolderContentsTool(BaseTool):
                     files.extend(search_drive(folder_id=descendant_id, page_size=MAX_RESULT_FILES))
 
             files = dedupe_files(files)[:MAX_RESULT_FILES]
+            logger.info("Tool search_folder_contents complete count=%s", len(files))
             return json.dumps({"files": _compact_tool_files(files), "count": len(files)})
         except Exception as exc:
             logger.exception("search_folder_contents failed folder=%r", folder_name)

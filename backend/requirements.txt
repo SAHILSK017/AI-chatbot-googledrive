@@ -6,6 +6,8 @@ langchain-groq==0.1.2
 google-api-python-client==2.108.0
 google-auth-httplib2==0.1.1
 google-auth-oauthlib==1.1.0
+httplib2==0.22.0
 python-dotenv==1.0.0
+requests==2.31.0
 cachetools==5.3.2
 rapidfuzz==3.6.1

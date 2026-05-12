@@ -1,13 +1,16 @@
 import logging
 import os
+import time
 from typing import Any
 
+import asyncio
 import requests as http
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from backend.agent import chat_with_agent
 from backend.google_drive import DriveConfigurationError
@@ -19,6 +22,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+CHAT_TIMEOUT_SECONDS = float(os.getenv("CHAT_TIMEOUT_SECONDS", "45"))
 
 app = FastAPI(title="Drive Agent API")
 
@@ -39,19 +43,91 @@ class ChatResponse(BaseModel):
     response: str
     files: list[dict[str, Any]] = Field(default_factory=list)
     tool_used: bool = False
+    error: str | None = None
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    started = time.monotonic()
+    logger.info("Incoming request method=%s path=%s", request.method, request.url.path)
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("Request failed method=%s path=%s", request.method, request.url.path)
+        raise
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    logger.info(
+        "Request complete method=%s path=%s status=%s duration_ms=%s",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
+
+
+@app.on_event("startup")
+async def startup_checks():
+    logger.info("Backend startup begin")
+    logger.info("Chat timeout seconds=%s", CHAT_TIMEOUT_SECONDS)
+    logger.info("GROQ_API_KEY configured=%s", bool(os.getenv("GROQ_API_KEY")))
+    logger.info(
+        "Google Drive env configured=%s",
+        bool(
+            os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+            or os.getenv("GOOGLE_SERVICE_ACCOUNT_INFO")
+            or os.getenv("GOOGLE_CREDENTIALS_JSON")
+            or os.getenv("GOOGLE_SERVICE_ACCOUNT_BASE64")
+            or os.getenv("GOOGLE_DRIVE_TOKEN")
+        ),
+    )
+    if os.getenv("PRELOAD_DRIVE_ON_STARTUP", "false").lower() == "true":
+        try:
+            await run_in_threadpool(get_drive_service)
+            logger.info("Google Drive service preloaded successfully")
+        except Exception:
+            logger.exception("Google Drive preload failed")
+    logger.info("Backend startup complete")
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    message = (req.message or "").strip()
+    logger.info("Chat request received length=%s query=%r", len(message), message[:500])
     try:
-        text, files, tool_used = chat_with_agent(req.message)
+        text, files, tool_used = await asyncio.wait_for(
+            run_in_threadpool(chat_with_agent, message),
+            timeout=CHAT_TIMEOUT_SECONDS,
+        )
+        logger.info(
+            "Chat request complete files=%s tool_used=%s response_length=%s",
+            len(files),
+            tool_used,
+            len(text or ""),
+        )
         return ChatResponse(response=text, files=files, tool_used=tool_used)
+    except asyncio.TimeoutError:
+        logger.exception("Chat request timed out after %ss query=%r", CHAT_TIMEOUT_SECONDS, message[:500])
+        return JSONResponse(
+            status_code=504,
+            content=ChatResponse(
+                response="Server temporarily unavailable. Please try again.",
+                files=[],
+                tool_used=False,
+                error="chat_timeout",
+            ).model_dump(),
+        )
     except Exception:
-        logger.exception("Unhandled /chat failure")
-        return ChatResponse(
-            response="I couldn't complete that request. Please try again.",
-            files=[],
-            tool_used=False,
+        logger.exception("Unhandled /chat failure query=%r", message[:500])
+        return JSONResponse(
+            status_code=500,
+            content=ChatResponse(
+                response="Server temporarily unavailable. Please try again.",
+                files=[],
+                tool_used=False,
+                error="chat_failed",
+            ).model_dump(),
         )
 
 

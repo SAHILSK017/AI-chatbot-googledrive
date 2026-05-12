@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from typing import Any
 
 from langchain.agents import AgentType, initialize_agent
@@ -15,6 +17,7 @@ from backend.tools import DriveSearchTool, SearchFolderContentsTool, parse_query
 logger = logging.getLogger(__name__)
 
 _agent = None
+_agent_lock = threading.RLock()
 _memory = ConversationBufferWindowMemory(
     k=int(os.getenv("MEMORY_WINDOW", "3")),
     memory_key="chat_history",
@@ -51,30 +54,37 @@ def _build_system_prompt() -> str:
 
 def _get_agent():
     global _agent
-    if _agent is not None:
+    with _agent_lock:
+        if _agent is not None:
+            logger.debug("Reusing cached LangChain agent")
+            return _agent
+
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            logger.error("GROQ_API_KEY missing; cannot initialize chat model")
+            raise ValueError("GROQ_API_KEY missing")
+
+        logger.info("Initializing LangChain agent model=%s", os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"))
+        llm = ChatGroq(
+            temperature=0.0,
+            model_name=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+            groq_api_key=api_key,
+            request_timeout=float(os.getenv("AI_REQUEST_TIMEOUT_SECONDS", "30")),
+            max_retries=int(os.getenv("AI_MAX_RETRIES", "1")),
+        )
+        _agent = initialize_agent(
+            [DriveSearchTool(), SearchFolderContentsTool()],
+            llm,
+            agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
+            memory=_memory,
+            verbose=os.getenv("LANGCHAIN_VERBOSE", "false").lower() == "true",
+            return_intermediate_steps=False,
+            handle_parsing_errors=True,
+            max_iterations=2,
+            agent_kwargs={"system_message": _build_system_prompt()},
+        )
+        logger.info("LangChain agent initialized")
         return _agent
-
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY missing")
-
-    llm = ChatGroq(
-        temperature=0.0,
-        model_name=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
-        groq_api_key=api_key,
-    )
-    _agent = initialize_agent(
-        [DriveSearchTool(), SearchFolderContentsTool()],
-        llm,
-        agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
-        memory=_memory,
-        verbose=os.getenv("LANGCHAIN_VERBOSE", "false").lower() == "true",
-        return_intermediate_steps=False,
-        handle_parsing_errors=True,
-        max_iterations=2,
-        agent_kwargs={"system_message": _build_system_prompt()},
-    )
-    return _agent
 
 
 def _looks_like_search_query(message: str) -> bool:
@@ -141,9 +151,17 @@ def _format_response(message: str, files: list[dict[str, Any]]) -> str:
 
 
 def _agent_invoke(message: str) -> tuple[str, list[dict[str, Any]], bool]:
+    started = time.monotonic()
+    logger.info("AI response generation started prompt_length=%s", len(message or ""))
     agent = _get_agent()
-    result = agent.invoke({"input": message})
+    with _agent_lock:
+        result = agent.invoke({"input": message})
     text = result.get("output", "") if isinstance(result, dict) else str(result)
+    logger.info(
+        "AI response generation complete duration_ms=%s response_length=%s",
+        int((time.monotonic() - started) * 1000),
+        len(text or ""),
+    )
     return text, [], False
 
 
@@ -151,6 +169,7 @@ def _enhance_with_agent(message: str, files: list[dict[str, Any]]) -> str | None
     if not files or os.getenv("AI_ENHANCE_RESULTS", "false").lower() != "true":
         return None
     if not os.getenv("GROQ_API_KEY"):
+        logger.info("Skipping AI enhancement because GROQ_API_KEY is not configured")
         return None
     if _is_simple_search(message) or len(files) > int(os.getenv("AI_ENHANCE_MAX_FILES", "5")):
         return None
@@ -161,6 +180,7 @@ def _enhance_with_agent(message: str, files: list[dict[str, Any]]) -> str | None
         f"Query: {message}. Count: {len(files)}. Examples: {', '.join(names)}."
     )
     try:
+        logger.info("AI enhancement started files=%s query=%r", len(files), message[:300])
         text, _, _ = _agent_invoke(prompt)
     except Exception as exc:
         if _is_groq_limit_error(exc):
@@ -177,21 +197,28 @@ def _enhance_with_agent(message: str, files: list[dict[str, Any]]) -> str | None
 
 def chat_with_agent(message: str):
     """Deterministic Drive search first, LangChain agent second."""
+    started = time.monotonic()
     clean = (message or "").strip()
+    logger.info("Chat pipeline started query=%r", clean[:500])
     if not clean:
+        logger.info("Chat pipeline received empty query")
         return "Ask me what you want to find in Google Drive.", [], False
 
     is_search_query = _looks_like_search_query(clean)
     direct_files: list[dict[str, Any]] = []
+    logger.info("Chat query classified search_query=%s", is_search_query)
 
     if is_search_query:
         try:
+            logger.info("Deterministic Drive search started query=%r", clean[:500])
             direct_files = dedupe_files(staged_search(clean))
-            logger.debug("Direct search count=%s message=%r", len(direct_files), clean)
+            logger.info("Deterministic Drive search complete count=%s query=%r", len(direct_files), clean[:500])
             if direct_files:
                 if _is_simple_search(clean):
+                    logger.info("Chat pipeline complete via deterministic simple search")
                     return _format_response(clean, direct_files), direct_files, True
                 enhanced = _enhance_with_agent(clean, direct_files)
+                logger.info("Chat pipeline complete via deterministic search enhanced=%s", bool(enhanced))
                 return enhanced or _format_response(clean, direct_files), direct_files, True
         except DriveConfigurationError as exc:
             logger.error("Drive configuration error: %s", exc)
@@ -208,6 +235,7 @@ def chat_with_agent(message: str):
             logger.exception("Direct deterministic search failed message=%r", clean)
 
     try:
+        logger.info("LangChain agent fallback started query=%r", clean[:500])
         text, agent_files, tool_used = _agent_invoke(clean)
         files = dedupe_files(direct_files + agent_files)
 
@@ -220,10 +248,13 @@ def chat_with_agent(message: str):
         if files:
             if not text or ("no file" in text.lower() and files):
                 text = _format_response(clean, files)
+            logger.info("Chat pipeline complete with files=%s duration_ms=%s", len(files), int((time.monotonic() - started) * 1000))
             return text, files, True
 
         if is_search_query:
+            logger.info("Chat pipeline complete no search results duration_ms=%s", int((time.monotonic() - started) * 1000))
             return _format_response(clean, []), [], True
+        logger.info("Chat pipeline complete no files duration_ms=%s", int((time.monotonic() - started) * 1000))
         return text or "I can help search your Google Drive.", [], tool_used
 
     except Exception as exc:

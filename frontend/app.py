@@ -13,6 +13,8 @@ load_dotenv()
 
 API_URL = os.getenv("API_URL", "http://localhost:8000/chat")
 BACKEND_BASE = os.getenv("BACKEND_BASE_URL", "http://localhost:8000")
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "50"))
+FRIENDLY_SERVER_ERROR = "Server temporarily unavailable. Please try again."
 
 st.set_page_config(page_title="Drive Agent", page_icon="📂", layout="wide")
 inject_custom_css()
@@ -49,9 +51,23 @@ if prompt:
     with st.chat_message("assistant", avatar="🤖"):
         with st.spinner("Searching Drive..."):
             try:
-                resp = requests.post(API_URL, json={"message": prompt})
-                resp.raise_for_status()
-                data = resp.json()
+                resp = requests.post(
+                    API_URL,
+                    json={"message": prompt},
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
+
+                if resp.status_code >= 500:
+                    raise requests.exceptions.HTTPError(FRIENDLY_SERVER_ERROR, response=resp)
+                if resp.status_code >= 400:
+                    detail = data.get("detail") if isinstance(data, dict) else None
+                    raise requests.exceptions.HTTPError(detail or FRIENDLY_SERVER_ERROR, response=resp)
+                if not isinstance(data, dict):
+                    raise ValueError("Backend returned an invalid response.")
 
                 text = data.get("response", "No response received.")
                 files = data.get("files", [])
@@ -67,8 +83,18 @@ if prompt:
                 elif tool_used:
                     st.toast("No matching files found.", icon="ℹ️")
 
-            except requests.exceptions.RequestException as e:
-                msg = f"Could not reach the backend: {e}"
+            except requests.exceptions.Timeout:
+                msg = FRIENDLY_SERVER_ERROR
+                st.error(msg)
+                st.session_state.messages.append({"role": "assistant", "content": msg})
+                st.toast("Request timed out")
+            except ValueError:
+                msg = FRIENDLY_SERVER_ERROR
+                st.error(msg)
+                st.session_state.messages.append({"role": "assistant", "content": msg})
+                st.toast("Invalid server response")
+            except requests.exceptions.RequestException:
+                msg = FRIENDLY_SERVER_ERROR
                 st.error(msg)
                 st.session_state.messages.append({"role": "assistant", "content": msg})
                 st.toast("Connection error", icon="❌")
