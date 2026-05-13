@@ -6,6 +6,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any, Type
 
 from langchain.pydantic_v1 import BaseModel, Field
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 MAX_RESULT_FILES = int(os.getenv("MAX_RESULT_FILES", "30"))
 MAX_SEARCH_FOLDERS = int(os.getenv("MAX_SEARCH_FOLDERS", "60"))
 MAX_TOOL_FILES = int(os.getenv("MAX_TOOL_FILES", "8"))
+SEARCH_TIMEOUT_SECONDS = float(os.getenv("SEARCH_TIMEOUT_SECONDS", "35"))
 
 STOPWORDS = {
     "a", "an", "all", "any", "can", "could", "drive", "file", "files",
@@ -371,6 +373,13 @@ def _local_filter(files: list[dict[str, Any]], parsed: ParsedQuery) -> list[dict
     return filtered
 
 
+def _check_search_timeout(started: float, stage: str) -> None:
+    elapsed = time.monotonic() - started
+    if elapsed > SEARCH_TIMEOUT_SECONDS:
+        logger.error("Search timeout stage=%s elapsed_seconds=%.2f", stage, elapsed)
+        raise TimeoutError(f"Drive search timed out during {stage}")
+
+
 def find_matching_folders(parsed: ParsedQuery, root_folder_id: str | None = None) -> list[dict[str, Any]]:
     logger.info("Folder matching started terms=%s root=%s", parsed.folder_terms or parsed.terms, root_folder_id)
     terms = parsed.folder_terms or parsed.terms
@@ -412,6 +421,7 @@ def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str
     logger.info("Staged Drive search started query=%r root=%s", raw_query[:500], root)
 
     if parsed.wants_folders:
+        _check_search_timeout(started, "folder_match")
         results = dedupe_files(find_matching_folders(parsed, root))[:MAX_RESULT_FILES]
         logger.info(
             "Staged Drive folder search complete count=%s duration_ms=%s",
@@ -422,6 +432,7 @@ def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str
 
     scope_folder_ids: list[str] | None = None
     if parsed.folder_scoped and parsed.folder_terms:
+        _check_search_timeout(started, "folder_scope")
         folders = find_matching_folders(parsed, root)
         scope_folder_ids = []
         for folder in folders[:5]:
@@ -439,6 +450,7 @@ def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str
             logger.info("Staged Drive search stopped: no matching scope folders")
             return []
     elif root:
+        _check_search_timeout(started, "root_scope")
         scope_folder_ids = _folder_scope(root)
 
     stages = [
@@ -452,6 +464,7 @@ def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str
     for stage_name, query in stages:
         if not query:
             continue
+        _check_search_timeout(started, stage_name)
         logger.info("Search stage started stage=%s query=%r folders=%s", stage_name, query, len(scope_folder_ids or []))
         results = _search_many_folders(query, scope_folder_ids)
         if results:
@@ -466,6 +479,7 @@ def staged_search(raw_query: str, folder_id: str | None = None) -> list[dict[str
 
     # Final fallback: list visible scope and fuzzy-filter locally.
     logger.info("Search stage started stage=fuzzy_list folders=%s", len(scope_folder_ids or []))
+    _check_search_timeout(started, "fuzzy_list")
     pool = _search_many_folders("", scope_folder_ids, per_folder_limit=100)
     matches = _local_filter(pool, parsed)
     scored = sorted(
@@ -542,3 +556,22 @@ class SearchFolderContentsTool(BaseTool):
 
     async def _arun(self, folder_name: str) -> str:
         return self._run(folder_name)
+
+
+@lru_cache(maxsize=1)
+def get_drive_search_tool() -> DriveSearchTool:
+    logger.info("Loading google_drive_search tool")
+    return DriveSearchTool()
+
+
+@lru_cache(maxsize=1)
+def get_folder_contents_tool() -> SearchFolderContentsTool:
+    logger.info("Loading search_folder_contents tool")
+    return SearchFolderContentsTool()
+
+
+def preload_tools() -> None:
+    started = time.monotonic()
+    get_drive_search_tool()
+    get_folder_contents_tool()
+    logger.info("Tools preloaded duration_ms=%s", int((time.monotonic() - started) * 1000))

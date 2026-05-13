@@ -16,6 +16,28 @@ BACKEND_BASE = os.getenv("BACKEND_BASE_URL", "http://localhost:8000")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "50"))
 FRIENDLY_SERVER_ERROR = "Server temporarily unavailable. Please try again."
 
+
+def post_chat_with_retry(prompt: str) -> requests.Response:
+    last_error = None
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                API_URL,
+                json={"message": prompt},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            if attempt == 0 and resp.status_code >= 500:
+                continue
+            return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_error = exc
+            if attempt == 0:
+                continue
+            raise
+    if last_error:
+        raise last_error
+    raise requests.exceptions.RequestException("Chat request failed")
+
 st.set_page_config(page_title="Drive Agent", page_icon="📂", layout="wide")
 inject_custom_css()
 
@@ -51,11 +73,7 @@ if prompt:
     with st.chat_message("assistant", avatar="🤖"):
         with st.spinner("Searching Drive..."):
             try:
-                resp = requests.post(
-                    API_URL,
-                    json={"message": prompt},
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                )
+                resp = post_chat_with_retry(prompt)
                 try:
                     data = resp.json()
                 except ValueError:

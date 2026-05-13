@@ -12,7 +12,13 @@ from langchain.memory import ConversationBufferWindowMemory
 from langchain_groq import ChatGroq
 
 from backend.google_drive import DriveConfigurationError, DriveRateLimitError, dedupe_files
-from backend.tools import DriveSearchTool, SearchFolderContentsTool, parse_query, staged_search
+from backend.tools import (
+    get_drive_search_tool,
+    get_folder_contents_tool,
+    parse_query,
+    preload_tools,
+    staged_search,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +48,8 @@ GROQ_LIMIT_MARKERS = (
     "rate limit",
     "429",
 )
+AI_RETRY_ATTEMPTS = int(os.getenv("AI_RETRY_ATTEMPTS", "2"))
+AI_RETRY_DELAY_SECONDS = float(os.getenv("AI_RETRY_DELAY_SECONDS", "0.75"))
 
 
 def _build_system_prompt() -> str:
@@ -73,7 +81,7 @@ def _get_agent():
             max_retries=int(os.getenv("AI_MAX_RETRIES", "1")),
         )
         _agent = initialize_agent(
-            [DriveSearchTool(), SearchFolderContentsTool()],
+            [get_drive_search_tool(), get_folder_contents_tool()],
             llm,
             agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
             memory=_memory,
@@ -84,7 +92,14 @@ def _get_agent():
             agent_kwargs={"system_message": _build_system_prompt()},
         )
         logger.info("LangChain agent initialized")
-        return _agent
+    return _agent
+
+
+def preload_agent() -> None:
+    started = time.monotonic()
+    preload_tools()
+    _get_agent()
+    logger.info("Agent preloaded duration_ms=%s", int((time.monotonic() - started) * 1000))
 
 
 def _looks_like_search_query(message: str) -> bool:
@@ -154,8 +169,20 @@ def _agent_invoke(message: str) -> tuple[str, list[dict[str, Any]], bool]:
     started = time.monotonic()
     logger.info("AI response generation started prompt_length=%s", len(message or ""))
     agent = _get_agent()
-    with _agent_lock:
-        result = agent.invoke({"input": message})
+    last_exc: Exception | None = None
+    for attempt in range(1, max(AI_RETRY_ATTEMPTS, 1) + 1):
+        try:
+            with _agent_lock:
+                result = agent.invoke({"input": message})
+            break
+        except Exception as exc:
+            last_exc = exc
+            logger.exception("AI response generation failed attempt=%s", attempt)
+            if attempt >= max(AI_RETRY_ATTEMPTS, 1) or _is_groq_limit_error(exc):
+                raise
+            time.sleep(AI_RETRY_DELAY_SECONDS)
+    else:
+        raise last_exc or RuntimeError("AI response generation failed")
     text = result.get("output", "") if isinstance(result, dict) else str(result)
     logger.info(
         "AI response generation complete duration_ms=%s response_length=%s",
@@ -241,7 +268,7 @@ def chat_with_agent(message: str):
 
         if is_search_query and not tool_used:
             logger.warning("Agent skipped tool for search query=%r; forcing google_drive_search", clean)
-            forced_files = _files_from_observation(DriveSearchTool()._run(clean))
+            forced_files = _files_from_observation(get_drive_search_tool()._run(clean))
             files = dedupe_files(files + forced_files)
             tool_used = True
 

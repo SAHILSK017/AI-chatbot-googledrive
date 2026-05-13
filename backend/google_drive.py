@@ -26,6 +26,8 @@ DRIVE_FIELDS = (
 )
 FOLDER_MIME = "application/vnd.google-apps.folder"
 DRIVE_API_TIMEOUT_SECONDS = int(os.getenv("DRIVE_API_TIMEOUT_SECONDS", "20"))
+DRIVE_RETRY_ATTEMPTS = int(os.getenv("DRIVE_RETRY_ATTEMPTS", "2"))
+DRIVE_RETRY_DELAY_SECONDS = float(os.getenv("DRIVE_RETRY_DELAY_SECONDS", "0.75"))
 _drive_http_lock = threading.RLock()
 
 
@@ -176,6 +178,33 @@ def _with_default_filters(query: str | None, folder_id: str | None) -> str:
     return " and ".join(clauses) if clauses else "trashed=false"
 
 
+def _is_transient_drive_error(exc: Exception) -> bool:
+    if isinstance(exc, HttpError):
+        status = getattr(exc.resp, "status", None)
+        return status in {408, 429, 500, 502, 503, 504}
+    return isinstance(exc, (TimeoutError, OSError, httplib2.HttpLib2Error))
+
+
+def _execute_with_retry(request: Any, description: str) -> dict[str, Any]:
+    attempts = max(DRIVE_RETRY_ATTEMPTS, 1)
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with _drive_http_lock:
+                return request.execute()
+        except Exception as exc:
+            last_exc = exc
+            logger.exception("Google Drive request failed description=%s attempt=%s", description, attempt)
+            if attempt >= attempts or not _is_transient_drive_error(exc):
+                raise
+            time.sleep(DRIVE_RETRY_DELAY_SECONDS)
+    raise last_exc or RuntimeError("Google Drive request failed")
+
+
+def execute_drive_request(request: Any, description: str) -> dict[str, Any]:
+    return _execute_with_retry(request, description)
+
+
 def search_drive(
     query: str | None = None,
     folder_id: str | None = None,
@@ -209,20 +238,18 @@ def search_drive(
                 batch_size,
                 remaining,
             )
-            with _drive_http_lock:
-                response = (
-                    service.files()
-                    .list(
-                        q=q,
-                        pageSize=batch_size,
-                        pageToken=page_token,
-                        fields=DRIVE_FIELDS,
-                        orderBy=order_by,
-                        includeItemsFromAllDrives=True,
-                        supportsAllDrives=True,
-                    )
-                    .execute()
-                )
+            response = _execute_with_retry(
+                service.files().list(
+                    q=q,
+                    pageSize=batch_size,
+                    pageToken=page_token,
+                    fields=DRIVE_FIELDS,
+                    orderBy=order_by,
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                ),
+                description=f"files.list page={page_number}",
+            )
             files.extend(_normalize_file(file) for file in response.get("files", []))
             page_token = response.get("nextPageToken")
             remaining = page_size - len(files)
