@@ -214,6 +214,6 @@ async def thumbnail(file_id: str):
     return await run_in_threadpool(_fetch_thumbnail_response, file_id)
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok"}
